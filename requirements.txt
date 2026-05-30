@@ -1,0 +1,6 @@
+flask==3.0.3
+yt-dlp
+opencv-python-headless
+mediapipe
+face-recognition
+gunicorn
