@@ -1,30 +1,33 @@
 """
-Abdul Tool — Flask API Server
-Railway.app pe deploy karo
+Abdul Tool — Flask API Server v3.0
 """
-from flask import Flask, request, jsonify, send_file
-import os, threading, uuid, datetime, subprocess, shutil, json
+from flask import Flask, request, jsonify
+import os, threading, uuid, subprocess, shutil, tempfile
 
 app = Flask(__name__)
 JOBS         = {}
 DOWNLOAD_DIR = "/tmp/downloads"
 CLIPS_DIR    = "/tmp/clips"
+UPLOAD_DIR   = "/tmp/uploads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(CLIPS_DIR,    exist_ok=True)
+os.makedirs(UPLOAD_DIR,   exist_ok=True)
 
 API_KEY = os.environ.get("API_KEY", "abdultool-secret-2024")
 
 def check_auth():
     return request.headers.get("X-API-Key", "") == API_KEY
 
-# ── Health ───────────────────────────────────────────────────────────────────
+def update_job(job_id, **kwargs):
+    if job_id in JOBS:
+        JOBS[job_id].update(kwargs)
+
+# ── Health ────────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    # Check ffmpeg available
     try:
-        result = subprocess.run(["ffmpeg", "-version"],
-            capture_output=True, text=True, timeout=5)
-        ffmpeg_ok = "ffmpeg version" in result.stdout
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        ffmpeg_ok = r.returncode == 0
     except Exception:
         ffmpeg_ok = False
     try:
@@ -32,21 +35,15 @@ def health():
         ytdlp_ok = True
     except Exception:
         ytdlp_ok = False
-    return jsonify({
-        "status":    "ok",
-        "app":       "Abdul Tool API",
-        "version":   "2.0",
-        "ffmpeg":    ffmpeg_ok,
-        "yt_dlp":    ytdlp_ok,
-    })
+    return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok, "yt_dlp": ytdlp_ok, "version": "3.0"})
 
-# ── Download video ────────────────────────────────────────────────────────────
+# ── Download video (URL) ──────────────────────────────────────────────────────
 @app.route("/download", methods=["POST"])
 def download():
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
-    data = request.get_json()
-    url  = (data or {}).get("url", "").strip()
+    data = request.get_json() or {}
+    url  = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "URL required"}), 400
 
@@ -55,7 +52,8 @@ def download():
         "status": "queued", "percent": 0,
         "downloaded_mb": 0, "total_mb": 0,
         "speed_kb": 0, "eta_sec": 0,
-        "result": None, "filename": None, "error": None
+        "result": None, "filename": None,
+        "size_mb": 0, "error": None
     }
 
     def _run():
@@ -66,49 +64,104 @@ def download():
             if d.get("status") == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
                 dl    = d.get("downloaded_bytes", 0)
-                JOBS[job_id].update({
-                    "status":        "downloading",
-                    "percent":       round(dl / total * 100, 1),
-                    "downloaded_mb": round(dl / 1048576, 1),
-                    "total_mb":      round(total / 1048576, 1),
-                    "speed_kb":      round((d.get("speed") or 0) / 1024, 1),
-                    "eta_sec":       d.get("eta") or 0,
-                })
+                update_job(job_id,
+                    status        = "downloading",
+                    percent       = round(dl / total * 100, 1),
+                    downloaded_mb = round(dl / 1048576, 1),
+                    total_mb      = round(total / 1048576, 1),
+                    speed_kb      = round((d.get("speed") or 0) / 1024, 1),
+                    eta_sec       = d.get("eta") or 0,
+                )
             elif d.get("status") == "finished":
-                JOBS[job_id].update({"status": "processing", "percent": 99})
+                update_job(job_id, status="processing", percent=99)
 
-        opts = {
-            "format":              "bestvideo[height<=720]+bestaudio/best",
-            "merge_output_format": "mp4",
-            "outtmpl":             out_tmpl,
-            "progress_hooks":      [_hook],
-            "noplaylist":          True,
-            "quiet":               True,
-            "extractor_args":      {"youtube": {"player_client": ["android", "web"]}},
-            "http_headers":        {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+        # ✅ Multiple fallback formats to bypass bot detection
+        format_attempts = [
+            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
+            "18",   # YouTube format 18 = 360p mp4 (rarely blocked)
+            "best",
+        ]
+
+        opts_base = {
+            "outtmpl":         out_tmpl,
+            "progress_hooks":  [_hook],
+            "noplaylist":      True,
+            "quiet":           True,
+            "no_warnings":     True,
+            "socket_timeout":  30,
+            "retries":         3,
+            # ✅ Android client bypasses bot check
+            "extractor_args":  {
+                "youtube": {
+                    "player_client": ["android_vr", "android", "web"],
+                    "player_skip":   ["webpage", "configs"],
+                }
+            },
+            "http_headers": {
+                "User-Agent": (
+                    "com.google.android.youtube/17.36.4 "
+                    "(Linux; U; Android 12; GB) gzip"
+                ),
             },
         }
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info  = ydl.extract_info(url, download=True)
-                fname = ydl.prepare_filename(info)
-                mp4   = os.path.splitext(fname)[0] + ".mp4"
-                path  = mp4 if os.path.exists(mp4) else fname
-                size  = os.path.getsize(path) / 1048576
-                JOBS[job_id].update({
-                    "status":   "done",
-                    "percent":  100,
-                    "result":   path,
-                    "filename": os.path.basename(path),
-                    "size_mb":  round(size, 1),
-                })
-        except Exception as e:
-            JOBS[job_id].update({"status": "failed", "error": str(e)})
+
+        last_error = None
+        for fmt in format_attempts:
+            try:
+                opts = {**opts_base, "format": fmt, "merge_output_format": "mp4"}
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info  = ydl.extract_info(url, download=True)
+                    fname = ydl.prepare_filename(info)
+                    mp4   = os.path.splitext(fname)[0] + ".mp4"
+                    path  = mp4 if os.path.exists(mp4) else fname
+                    if os.path.exists(path):
+                        size = os.path.getsize(path) / 1048576
+                        update_job(job_id,
+                            status="done", percent=100,
+                            result=path, filename=os.path.basename(path),
+                            size_mb=round(size, 1)
+                        )
+                        return  # success
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        update_job(job_id, status="failed", error=last_error or "All download attempts failed")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"job_id": job_id})
+
+# ── Upload video from device ──────────────────────────────────────────────────
+@app.route("/upload", methods=["POST"])
+def upload_video():
+    """Mobile device se video file upload karo — split ke liye"""
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if "video" not in request.files:
+        return jsonify({"error": "No video file in request"}), 400
+
+    file   = request.files["video"]
+    job_id = str(uuid.uuid4())[:8]
+
+    save_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    file.save(save_path)
+
+    size_mb = os.path.getsize(save_path) / 1048576
+    JOBS[job_id] = {
+        "status":   "done",
+        "percent":  100,
+        "result":   save_path,
+        "filename": file.filename,
+        "size_mb":  round(size_mb, 1),
+        "error":    None,
+    }
+    return jsonify({
+        "job_id":   job_id,
+        "filename": file.filename,
+        "size_mb":  round(size_mb, 1),
+        "message":  "Video uploaded successfully"
+    })
 
 # ── Job status ────────────────────────────────────────────────────────────────
 @app.route("/job/<job_id>", methods=["GET"])
@@ -130,15 +183,13 @@ def split():
     job_id    = data.get("job_id", "")
     clip_secs = int(data.get("clip_seconds", 4))
 
-    # Find video path
-    video_path = None
-    if job_id and job_id in JOBS and JOBS[job_id].get("status") == "done":
-        video_path = JOBS[job_id]["result"]
-    elif job_id == "device_video":
-        return jsonify({"error": "Device video split not supported on server. Use URL download first."}), 400
+    job = JOBS.get(job_id)
+    if not job or job.get("status") != "done":
+        return jsonify({"error": "Video not ready. Download or upload first."}), 400
 
+    video_path = job.get("result")
     if not video_path or not os.path.exists(video_path):
-        return jsonify({"error": "Video not found. Please download first."}), 400
+        return jsonify({"error": "Video file not found on server."}), 400
 
     split_job_id = f"{job_id}_split"
     JOBS[split_job_id] = {
@@ -151,12 +202,13 @@ def split():
             out_dir = os.path.join(CLIPS_DIR, job_id)
             os.makedirs(out_dir, exist_ok=True)
 
-            # Check ffmpeg
             ff = shutil.which("ffmpeg") or "ffmpeg"
 
-            # Get video duration first
-            probe_cmd = [ff, "-i", video_path]
-            probe = subprocess.run(probe_cmd, capture_output=True, text=True)
+            # Get duration
+            probe = subprocess.run(
+                [ff, "-i", video_path],
+                capture_output=True, text=True
+            )
             duration = 0
             for line in probe.stderr.split("\n"):
                 if "Duration:" in line:
@@ -166,8 +218,6 @@ def split():
                         duration = int(h)*3600 + int(m)*60 + float(s)
                     except Exception:
                         pass
-
-            JOBS[split_job_id]["total_duration"] = duration
 
             cmd = [
                 ff, "-i", video_path,
@@ -179,47 +229,40 @@ def split():
                 "-y",
                 os.path.join(out_dir, "clip_%04d.mp4")
             ]
+
             process = subprocess.Popen(
                 cmd, stderr=subprocess.PIPE,
                 stdout=subprocess.PIPE, text=True
             )
 
-            # Parse ffmpeg progress
             for line in process.stderr:
                 if "time=" in line and duration > 0:
                     try:
                         t_str = line.split("time=")[1].split(" ")[0].strip()
                         h, m, s = t_str.split(":")
-                        current = int(h)*3600 + int(m)*60 + float(s)
-                        pct = min(round(current / duration * 100, 1), 99)
-                        JOBS[split_job_id]["percent"] = pct
+                        cur = int(h)*3600 + int(m)*60 + float(s)
+                        pct = min(round(cur / duration * 100, 1), 99)
+                        update_job(split_job_id, percent=pct)
                     except Exception:
                         pass
 
             process.wait()
 
             if process.returncode != 0:
-                raise Exception(f"ffmpeg error (code {process.returncode})")
+                raise Exception(f"ffmpeg failed with code {process.returncode}")
 
             clips = sorted([
-                os.path.join(out_dir, f)
-                for f in os.listdir(out_dir)
-                if f.endswith(".mp4")
+                f for f in os.listdir(out_dir) if f.endswith(".mp4")
             ])
 
-            JOBS[split_job_id].update({
-                "status":  "done",
-                "percent": 100,
-                "clips":   [os.path.basename(c) for c in clips],
-                "count":   len(clips),
-                "job_dir": job_id,
-            })
+            update_job(split_job_id,
+                status="done", percent=100,
+                clips=clips, count=len(clips),
+                job_dir=job_id
+            )
 
         except Exception as e:
-            JOBS[split_job_id].update({
-                "status": "failed",
-                "error":  str(e)
-            })
+            update_job(split_job_id, status="failed", error=str(e))
 
     threading.Thread(target=_split, daemon=True).start()
     return jsonify({"split_job_id": split_job_id})
@@ -230,13 +273,13 @@ def face_filter():
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
 
-    data          = request.get_json() or {}
-    job_id        = data.get("job_id", "")
-    filter_type   = data.get("filter_type", "any")
-    clip_dir      = os.path.join(CLIPS_DIR, job_id)
+    data        = request.get_json() or {}
+    job_id      = data.get("job_id", "")
+    filter_type = data.get("filter_type", "any")
+    clip_dir    = os.path.join(CLIPS_DIR, job_id)
 
     if not os.path.exists(clip_dir):
-        return jsonify({"error": "Clips not found. Run /split first."}), 400
+        return jsonify({"error": "No clips found. Run split first."}), 400
 
     filter_job_id = f"{job_id}_filter"
     JOBS[filter_job_id] = {
@@ -246,14 +289,16 @@ def face_filter():
 
     def _filter():
         try:
-            import cv2, mediapipe as mp
+            import cv2
+            import mediapipe as mp
+
             mp_face = mp.solutions.face_detection.FaceDetection(
                 model_selection=0, min_detection_confidence=0.5)
 
             clips   = sorted([f for f in os.listdir(clip_dir) if f.endswith(".mp4")])
             matched = []
             total   = len(clips)
-            JOBS[filter_job_id]["total"] = total
+            update_job(filter_job_id, total=total)
 
             for i, clip in enumerate(clips):
                 clip_path = os.path.join(clip_dir, clip)
@@ -273,36 +318,19 @@ def face_filter():
                 if found:
                     matched.append(clip)
 
-                pct = round((i + 1) / total * 100, 1)
-                JOBS[filter_job_id].update({
-                    "percent": pct,
-                    "matched": matched,
-                    "count":   len(matched),
-                })
+                pct = round((i+1) / total * 100, 1)
+                update_job(filter_job_id,
+                    percent=pct, matched=matched, count=len(matched))
 
-            JOBS[filter_job_id].update({
-                "status":  "done",
-                "percent": 100,
-                "matched": matched,
-                "count":   len(matched),
-                "total":   total,
-            })
+            update_job(filter_job_id,
+                status="done", percent=100,
+                matched=matched, count=len(matched), total=total)
+
         except Exception as e:
-            JOBS[filter_job_id].update({"status": "failed", "error": str(e)})
+            update_job(filter_job_id, status="failed", error=str(e))
 
     threading.Thread(target=_filter, daemon=True).start()
     return jsonify({"filter_job_id": filter_job_id})
-
-# ── Clips list ────────────────────────────────────────────────────────────────
-@app.route("/clips/<job_id>", methods=["GET"])
-def list_clips(job_id):
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-    clip_dir = os.path.join(CLIPS_DIR, job_id)
-    if not os.path.exists(clip_dir):
-        return jsonify({"clips": [], "count": 0})
-    clips = sorted([f for f in os.listdir(clip_dir) if f.endswith(".mp4")])
-    return jsonify({"clips": clips, "count": len(clips)})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
