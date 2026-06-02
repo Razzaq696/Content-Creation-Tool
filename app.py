@@ -1,8 +1,7 @@
 """
-Abdul Tool — Flask API Server v3.2
+Abdul Tool — Flask API Server v4.0
 Face Detection: YOLOv8 (ultralytics)
-- Any Face:      YOLOv8n-face — fast detection
-- Specific Face: YOLOv8n-face crop + cosine similarity embeddings
+Platforms: YouTube, TikTok, Instagram — cookies.txt based auth
 """
 from flask import Flask, request, jsonify, send_file
 import os, threading, uuid, subprocess, shutil, zipfile, io, traceback
@@ -21,7 +20,13 @@ for d in [DOWNLOAD_DIR, CLIPS_DIR, UPLOAD_DIR, REF_DIR, MODEL_DIR]:
 
 API_KEY = os.environ.get("API_KEY", "abdultool-secret-2024")
 
-# ── YOLO model path ────────────────────────────────────────────────────────────
+# ── Cookies paths ──────────────────────────────────────────────────────────────
+BASE_DIR            = os.path.dirname(os.path.abspath(__file__))
+YOUTUBE_COOKIES     = os.path.join(BASE_DIR, "cookies.txt")
+INSTAGRAM_COOKIES   = os.path.join(BASE_DIR, "instagram_cookies.txt")
+TIKTOK_COOKIES      = os.path.join(BASE_DIR, "tiktok_cookies.txt")
+
+# ── YOLO model ─────────────────────────────────────────────────────────────────
 YOLO_FACE_MODEL = os.path.join(MODEL_DIR, "yolov8n-face.pt")
 YOLO_MODEL_URL  = "https://github.com/SannketNikam/Face-Detection/raw/main/yolov8n-face.pt"
 
@@ -50,6 +55,29 @@ def check_auth():
 def update_job(job_id, **kwargs):
     if job_id in JOBS:
         JOBS[job_id].update(kwargs)
+
+def detect_platform(url):
+    url_lower = url.lower()
+    if "youtube.com" in url_lower or "youtu.be" in url_lower:
+        return "youtube"
+    elif "tiktok.com" in url_lower or "vm.tiktok" in url_lower:
+        return "tiktok"
+    elif "instagram.com" in url_lower:
+        return "instagram"
+    else:
+        return "other"
+
+def get_cookies_path(platform):
+    if platform == "youtube" and os.path.exists(YOUTUBE_COOKIES):
+        return YOUTUBE_COOKIES
+    elif platform == "instagram" and os.path.exists(INSTAGRAM_COOKIES):
+        return INSTAGRAM_COOKIES
+    elif platform == "tiktok" and os.path.exists(TIKTOK_COOKIES):
+        return TIKTOK_COOKIES
+    # fallback: try generic cookies.txt for any platform
+    elif os.path.exists(YOUTUBE_COOKIES):
+        return YOUTUBE_COOKIES
+    return None
 
 def get_face_embedding(img_rgb):
     import cv2, numpy as np
@@ -100,8 +128,47 @@ def health():
         from ultralytics import YOLO; yolo_ok = True
     except Exception:
         pass
-    return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok,
-                    "yt_dlp": ytdlp_ok, "yolo": yolo_ok, "version": "3.2"})
+
+    cookies_status = {
+        "youtube":   os.path.exists(YOUTUBE_COOKIES),
+        "instagram": os.path.exists(INSTAGRAM_COOKIES),
+        "tiktok":    os.path.exists(TIKTOK_COOKIES),
+    }
+
+    return jsonify({
+        "status":  "ok",
+        "ffmpeg":  ffmpeg_ok,
+        "yt_dlp":  ytdlp_ok,
+        "yolo":    yolo_ok,
+        "cookies": cookies_status,
+        "version": "4.0"
+    })
+
+# ── Upload cookies.txt ─────────────────────────────────────────────────────────
+@app.route("/upload-cookies", methods=["POST"])
+def upload_cookies():
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    platform = request.form.get("platform", "youtube").lower()
+    if "file" not in request.files:
+        return jsonify({"error": "No file. Use field name: file"}), 400
+
+    file = request.files["file"]
+
+    paths = {
+        "youtube":   YOUTUBE_COOKIES,
+        "instagram": INSTAGRAM_COOKIES,
+        "tiktok":    TIKTOK_COOKIES,
+    }
+    save_path = paths.get(platform, YOUTUBE_COOKIES)
+    file.save(save_path)
+
+    return jsonify({
+        "success":  True,
+        "platform": platform,
+        "message":  f"cookies.txt saved for {platform}"
+    })
 
 # ── Download video (URL) ───────────────────────────────────────────────────────
 @app.route("/download", methods=["POST"])
@@ -124,7 +191,10 @@ def download():
 
     def _run():
         import yt_dlp
-        out_tmpl = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
+
+        platform     = detect_platform(url)
+        cookies_path = get_cookies_path(platform)
+        out_tmpl     = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
         def _hook(d):
             if d.get("status") == "downloading":
@@ -140,47 +210,90 @@ def download():
             elif d.get("status") == "finished":
                 update_job(job_id, status="processing", percent=99)
 
-        # ── Multiple format attempts ───────────────────────────────────────
-        format_attempts = [
-            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
-            "18",
-            "best",
-        ]
-
-        # ── Anti-bot / PO token options ───────────────────────────────────
-        common_opts = {
-            "outtmpl":            out_tmpl,
-            "progress_hooks":     [_hook],
-            "noplaylist":         True,
-            "quiet":              True,
-            "no_warnings":        True,
-            "socket_timeout":     30,
-            "retries":            5,
-            "fragment_retries":   5,
+        # ── Base options for all platforms ────────────────────────────────
+        base_opts = {
+            "outtmpl":             out_tmpl,
+            "progress_hooks":      [_hook],
+            "noplaylist":          True,
+            "quiet":               True,
+            "no_warnings":         True,
+            "socket_timeout":      30,
+            "retries":             10,
+            "fragment_retries":    10,
             "merge_output_format": "mp4",
-            # PO token / bot fix options
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["ios", "android", "web"],
-                    "player_skip":   ["configs"],
-                }
-            },
-            "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Linux; Android 12; Pixel 6) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/112.0.0.0 Mobile Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            # Cookie / age-gate bypass
         }
 
+        # Add cookies if available
+        if cookies_path:
+            base_opts["cookiefile"] = cookies_path
+
+        # ── Platform specific options ──────────────────────────────────────
+        if platform == "youtube":
+            base_opts.update({
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["android", "web"],
+                    }
+                },
+                "http_headers": {
+                    "User-Agent":      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            })
+            format_attempts = [
+                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
+                "18",
+                "best",
+            ]
+
+        elif platform == "tiktok":
+            base_opts.update({
+                "http_headers": {
+                    "User-Agent":      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+                    "Referer":         "https://www.tiktok.com/",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                "extractor_args": {
+                    "tiktok": {
+                        "api_hostname": ["api22-normal-c-useast2a.tiktokv.com"],
+                    }
+                },
+            })
+            format_attempts = [
+                "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+                "best",
+            ]
+
+        elif platform == "instagram":
+            base_opts.update({
+                "http_headers": {
+                    "User-Agent":      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            })
+            format_attempts = [
+                "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+                "best",
+            ]
+
+        else:
+            base_opts.update({
+                "http_headers": {
+                    "User-Agent":      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            })
+            format_attempts = [
+                "bestvideo[height<=720][ext=mp4]+bestaudio/best[height<=720][ext=mp4]/best",
+                "best",
+            ]
+
+        # ── Try each format ────────────────────────────────────────────────
         last_error = None
 
         for fmt in format_attempts:
             try:
-                opts = {**common_opts, "format": fmt}
+                opts = {**base_opts, "format": fmt}
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info  = ydl.extract_info(url, download=True)
                     fname = ydl.prepare_filename(info)
@@ -195,37 +308,7 @@ def download():
                         return
             except Exception as e:
                 last_error = str(e)
-                # If bot detection error — try next format immediately
-                if any(x in str(e).lower() for x in
-                       ["sign in", "bot", "captcha", "not a robot",
-                        "confirm your age", "po token", "403"]):
-                    continue
-
-        # ── Last resort: try yt-dlp with ios client only ──────────────────
-        try:
-            opts_ios = {
-                **common_opts,
-                "format": "best[height<=480]/best",
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["ios"],
-                    }
-                },
-            }
-            with yt_dlp.YoutubeDL(opts_ios) as ydl:
-                info  = ydl.extract_info(url, download=True)
-                fname = ydl.prepare_filename(info)
-                mp4   = os.path.splitext(fname)[0] + ".mp4"
-                path  = mp4 if os.path.exists(mp4) else fname
-                if os.path.exists(path):
-                    update_job(job_id,
-                        status="done", percent=100,
-                        result=path,
-                        filename=os.path.basename(path),
-                        size_mb=round(os.path.getsize(path) / 1048576, 1))
-                    return
-        except Exception as e:
-            last_error = str(e)
+                continue
 
         update_job(job_id, status="failed",
                    error=last_error or "All download attempts failed")
@@ -288,8 +371,7 @@ def upload_ref_face():
         if embedding is None:
             os.remove(ref_path)
             return jsonify({
-                "error": "No face detected in reference image. "
-                         "Use a clear frontal photo with good lighting."
+                "error": "No face detected in reference image. Use a clear frontal photo."
             }), 400
 
         emb_path = os.path.join(REF_DIR, f"{job_id}_ref.npy")
@@ -297,7 +379,7 @@ def upload_ref_face():
 
         return jsonify({
             "success": True,
-            "message": "✅ Face detected and saved! Ready for specific face search."
+            "message": "Face detected and saved! Ready for specific face search."
         })
 
     except Exception as e:
@@ -400,7 +482,6 @@ def face_filter():
     clip_secs   = int(data.get("clip_seconds", 4))
     clip_dir    = os.path.join(CLIPS_DIR, job_id)
 
-    # Auto-split if clips don't exist yet
     clips_exist = (os.path.exists(clip_dir) and
                    any(f.endswith(".mp4") for f in os.listdir(clip_dir)))
     if not clips_exist:
