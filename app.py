@@ -122,24 +122,18 @@ def health():
     return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok,
                     "yt_dlp": ytdlp_ok, "yolo": yolo_ok, "version": "3.2"})
 
-# ── Download video (URL) ───────────────────────────────────────────────────────
+# ── Download ──────────────────────────────────────────────────────────────────
 @app.route("/download", methods=["POST"])
 def download():
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
+    if not auth(): return jsonify({"error":"Unauthorized"}),401
     data = request.get_json() or {}
-    url  = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "URL required"}), 400
+    url  = data.get("url","").strip()
+    if not url: return jsonify({"error":"URL required"}),400
 
     job_id = str(uuid.uuid4())[:8]
-    JOBS[job_id] = {
-        "status": "queued", "percent": 0,
-        "downloaded_mb": 0, "total_mb": 0,
-        "speed_kb": 0, "eta_sec": 0,
-        "result": None, "filename": None,
-        "size_mb": 0, "error": None
-    }
+    JOBS[job_id] = {"status":"queued","percent":0,"downloaded_mb":0,
+                    "total_mb":0,"speed_kb":0,"eta_sec":0,
+                    "result":None,"filename":None,"size_mb":0,"error":None}
 
     def _run():
         import yt_dlp
@@ -148,69 +142,46 @@ def download():
         def _hook(d):
             if d.get("status") == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
-                dl    = d.get("downloaded_bytes", 0)
-                update_job(job_id,
-                    status        = "downloading",
-                    percent       = round(dl / total * 100, 1),
-                    downloaded_mb = round(dl / 1048576, 1),
-                    total_mb      = round(total / 1048576, 1),
-                    speed_kb      = round((d.get("speed") or 0) / 1024, 1),
-                    eta_sec       = d.get("eta") or 0,
-                )
+                dl    = d.get("downloaded_bytes",0)
+                upd(job_id, status="downloading",
+                    percent=round(dl/total*100,1),
+                    downloaded_mb=round(dl/1048576,1),
+                    total_mb=round(total/1048576,1),
+                    speed_kb=round((d.get("speed") or 0)/1024,1),
+                    eta_sec=d.get("eta") or 0)
             elif d.get("status") == "finished":
-                update_job(job_id, status="processing", percent=99)
+                upd(job_id, status="processing", percent=99)
 
-        format_attempts = [
+        formats = [
             "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
-            "18",
-            "best",
+            "18", "best"
         ]
         opts_base = {
-            "outtmpl":        out_tmpl,
-            "progress_hooks": [_hook],
-            "noplaylist":     True,
-            "quiet":          True,
-            "no_warnings":    True,
-            "socket_timeout": 30,
-            "retries":        3,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android_vr", "android", "web"],
-                    "player_skip":   ["webpage", "configs"],
-                }
-            },
-            "http_headers": {
-                "User-Agent": (
-                    "com.google.android.youtube/17.36.4 "
-                    "(Linux; U; Android 12; GB) gzip"
-                ),
-            },
+            "outtmpl": out_tmpl, "progress_hooks":[_hook],
+            "noplaylist":True, "quiet":True,
+            "extractor_args":{"youtube":{"player_client":["android_vr","android","web"]}},
+            "http_headers":{"User-Agent":"com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"},
         }
-        last_error = None
-        for fmt in format_attempts:
+        last_err = None
+        for fmt in formats:
             try:
-                opts = {**opts_base, "format": fmt, "merge_output_format": "mp4"}
+                opts = {**opts_base,"format":fmt,"merge_output_format":"mp4"}
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info  = ydl.extract_info(url, download=True)
                     fname = ydl.prepare_filename(info)
-                    mp4   = os.path.splitext(fname)[0] + ".mp4"
+                    mp4   = os.path.splitext(fname)[0]+".mp4"
                     path  = mp4 if os.path.exists(mp4) else fname
                     if os.path.exists(path):
-                        size = os.path.getsize(path) / 1048576
-                        update_job(job_id,
-                            status="done", percent=100,
+                        upd(job_id, status="done", percent=100,
                             result=path, filename=os.path.basename(path),
-                            size_mb=round(size, 1)
-                        )
+                            size_mb=round(os.path.getsize(path)/1048576,1))
                         return
             except Exception as e:
-                last_error = str(e)
-                continue
-        update_job(job_id, status="failed",
-                   error=last_error or "All download attempts failed")
+                last_err = str(e)
+        upd(job_id, status="failed", error=last_err)
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"job_id": job_id})
+    return jsonify({"job_id":job_id})
 
 # ── Upload video from device ───────────────────────────────────────────────────
 @app.route("/upload", methods=["POST"])
