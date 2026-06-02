@@ -378,11 +378,29 @@ def face_filter():
     data        = request.get_json() or {}
     job_id      = data.get("job_id", "")
     filter_type = data.get("filter_type", "any")   # "any" | "specific"
-    threshold   = float(data.get("threshold", 0.75))  # cosine similarity threshold
+    threshold   = float(data.get("threshold", 0.75))
+    clip_secs   = int(data.get("clip_seconds", 4))
     clip_dir    = os.path.join(CLIPS_DIR, job_id)
 
-    if not os.path.exists(clip_dir):
-        return jsonify({"error": "No clips found. Run split first."}), 400
+    # ── Auto-split if clips don't exist yet ───────────────────────────────
+    clips_exist = (os.path.exists(clip_dir) and
+                   any(f.endswith(".mp4") for f in os.listdir(clip_dir)))
+    if not clips_exist:
+        job = JOBS.get(job_id)
+        if not job or not job.get("result"):
+            return jsonify({"error": "Video not found. Upload a video first."}), 400
+        video_path = job["result"]
+        if not os.path.exists(video_path):
+            return jsonify({"error": "Video file missing on server."}), 400
+        os.makedirs(clip_dir, exist_ok=True)
+        ff = shutil.which("ffmpeg") or "ffmpeg"
+        subprocess.run([
+            ff, "-i", video_path,
+            "-c", "copy", "-map", "0",
+            "-segment_time", str(clip_secs),
+            "-f", "segment", "-reset_timestamps", "1", "-y",
+            os.path.join(clip_dir, "clip_%04d.mp4")
+        ], capture_output=True)
 
     filter_job_id = f"{job_id}_filter"
     JOBS[filter_job_id] = {
@@ -468,7 +486,7 @@ def face_filter():
             update_job(filter_job_id,
                        status="done", percent=100,
                        matched=matched, count=len(matched),
-                       total=total, job_id=job_id)
+                       total=total, source_job_id=job_id)
 
         except Exception as e:
             update_job(filter_job_id, status="failed",
