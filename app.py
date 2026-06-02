@@ -174,7 +174,6 @@ def download():
                 "Accept-Language": "en-US,en;q=0.9",
             },
             # Cookie / age-gate bypass
-            "cookiesfrombrowser": None,  # no browser needed
         }
 
         last_error = None
