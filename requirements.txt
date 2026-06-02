@@ -1,6 +1,11 @@
+opencv-python-headless
+ffmpeg-python
 flask==3.0.3
 yt-dlp
 opencv-python-headless
-mediapipe
+mediapipe==0.10.9
+numpy
+face-recognition
+cmake
+dlib
 gunicorn
-ffmpeg-python
