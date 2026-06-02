@@ -23,7 +23,7 @@ API_KEY = os.environ.get("API_KEY", "abdultool-secret-2024")
 
 # ── YOLO model path ────────────────────────────────────────────────────────────
 YOLO_FACE_MODEL = os.path.join(MODEL_DIR, "yolov8n-face.pt")
-YOLO_MODEL_URL  = "https://github.com/akanametov/yolo-face/releases/download/v0.0.0/yolov8n-face.pt"
+YOLO_MODEL_URL  = "https://github.com/SannketNikam/Face-Detection/raw/main/yolov8n-face.pt"
 
 def get_yolo_model():
     """Load YOLOv8 face model — download once, cache in /tmp/models."""
