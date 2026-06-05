@@ -1,217 +1,107 @@
-"""
-Abdul Tool — Flask API Server v4.0
-Face Detection: YOLOv8 (ultralytics)
-Platforms: YouTube, TikTok, Instagram — cookies.txt based auth
+Abdul Tool — Flask API Server v5.0
+- YouTube fix: android_vr player
+- Face Detection: OpenCV Haar Cascade (no YOLO, no download needed!)
 """
 from flask import Flask, request, jsonify, send_file
 import os, threading, uuid, subprocess, shutil, zipfile, io, traceback
+import cv2
+import numpy as np
 
 app = Flask(__name__)
-
 JOBS         = {}
 DOWNLOAD_DIR = "/tmp/downloads"
 CLIPS_DIR    = "/tmp/clips"
 UPLOAD_DIR   = "/tmp/uploads"
 REF_DIR      = "/tmp/ref_faces"
-MODEL_DIR    = "/tmp/models"
-
-for d in [DOWNLOAD_DIR, CLIPS_DIR, UPLOAD_DIR, REF_DIR, MODEL_DIR]:
+for d in [DOWNLOAD_DIR, CLIPS_DIR, UPLOAD_DIR, REF_DIR]:
     os.makedirs(d, exist_ok=True)
 
 API_KEY = os.environ.get("API_KEY", "abdultool-secret-2024")
 
-# ── Cookies paths ──────────────────────────────────────────────────────────────
-BASE_DIR            = os.path.dirname(os.path.abspath(__file__))
-YOUTUBE_COOKIES     = os.path.join(BASE_DIR, "cookies.txt")
-INSTAGRAM_COOKIES   = os.path.join(BASE_DIR, "instagram_cookies.txt")
-TIKTOK_COOKIES      = os.path.join(BASE_DIR, "tiktok_cookies.txt")
+BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
+YOUTUBE_COOKIES  = os.path.join(BASE_DIR, "cookies.txt")
 
-# ── YOLO model ─────────────────────────────────────────────────────────────────
-YOLO_FACE_MODEL = os.path.join(MODEL_DIR, "yolov8n-face.pt")
-YOLO_MODEL_URL  = "https://github.com/SannketNikam/Face-Detection/raw/main/yolov8n-face.pt"
+# ── OpenCV Face Cascade (built-in, no download!) ──────────────────────────────
+FACE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-def get_yolo_model():
-    from ultralytics import YOLO
-    if not os.path.exists(YOLO_FACE_MODEL):
-        import urllib.request
-        urllib.request.urlretrieve(YOLO_MODEL_URL, YOLO_FACE_MODEL)
-    return YOLO(YOLO_FACE_MODEL)
-
-_yolo_model      = None
-_yolo_model_lock = threading.Lock()
-
-def yolo():
-    global _yolo_model
-    if _yolo_model is None:
-        with _yolo_model_lock:
-            if _yolo_model is None:
-                _yolo_model = get_yolo_model()
-    return _yolo_model
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
 def check_auth():
     return request.headers.get("X-API-Key", "") == API_KEY
 
-def update_job(job_id, **kwargs):
+def upd(job_id, **kw):
     if job_id in JOBS:
-        JOBS[job_id].update(kwargs)
+        JOBS[job_id].update(kw)
 
 def detect_platform(url):
-    url_lower = url.lower()
-    if "youtube.com" in url_lower or "youtu.be" in url_lower:
-        return "youtube"
-    elif "tiktok.com" in url_lower or "vm.tiktok" in url_lower:
-        return "tiktok"
-    elif "instagram.com" in url_lower:
-        return "instagram"
-    else:
-        return "other"
+    u = url.lower()
+    if "youtube.com" in u or "youtu.be" in u: return "youtube"
+    if "tiktok.com"  in u: return "tiktok"
+    if "instagram.com" in u: return "instagram"
+    return "other"
 
-def get_cookies_path(platform):
-    if platform == "youtube" and os.path.exists(YOUTUBE_COOKIES):
-        return YOUTUBE_COOKIES
-    elif platform == "instagram" and os.path.exists(INSTAGRAM_COOKIES):
-        return INSTAGRAM_COOKIES
-    elif platform == "tiktok" and os.path.exists(TIKTOK_COOKIES):
-        return TIKTOK_COOKIES
-    # fallback: try generic cookies.txt for any platform
-    elif os.path.exists(YOUTUBE_COOKIES):
-        return YOUTUBE_COOKIES
-    return None
-
-def get_face_embedding(img_rgb):
-    import cv2, numpy as np
-    model   = yolo()
-    results = model(img_rgb, verbose=False, conf=0.4)
-    boxes   = results[0].boxes
-    if boxes is None or len(boxes) == 0:
-        return None
-    best_box, best_area = None, 0
-    for box in boxes.xyxy.tolist():
-        x1, y1, x2, y2 = map(int, box[:4])
-        area = (x2 - x1) * (y2 - y1)
-        if area > best_area:
-            best_area = area
-            best_box  = (x1, y1, x2, y2)
-    if best_box is None:
-        return None
-    x1, y1, x2, y2 = best_box
-    h, w = img_rgb.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-    crop = img_rgb[y1:y2, x1:x2]
-    if crop.size == 0:
-        return None
-    crop_resized = cv2.resize(crop, (128, 128)).astype(np.float32) / 255.0
-    embedding    = crop_resized.flatten()
-    norm         = np.linalg.norm(embedding)
-    return embedding / norm if norm > 0 else embedding
-
-def cosine_similarity(a, b):
-    import numpy as np
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
-
-# ── Health ─────────────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    ffmpeg_ok = ytdlp_ok = yolo_ok = False
     try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
-        ffmpeg_ok = r.returncode == 0
-    except Exception:
-        pass
+        r = subprocess.run(["ffmpeg","-version"], capture_output=True, timeout=5)
+        ff = r.returncode == 0
+    except: ff = False
     try:
-        import yt_dlp; ytdlp_ok = True
-    except Exception:
-        pass
-    try:
-        from ultralytics import YOLO; yolo_ok = True
-    except Exception:
-        pass
-
-    cookies_status = {
-        "youtube":   os.path.exists(YOUTUBE_COOKIES),
-        "instagram": os.path.exists(INSTAGRAM_COOKIES),
-        "tiktok":    os.path.exists(TIKTOK_COOKIES),
-    }
-
+        import yt_dlp; yt = True
+    except: yt = False
     return jsonify({
-        "status":  "ok",
-        "ffmpeg":  ffmpeg_ok,
-        "yt_dlp":  ytdlp_ok,
-        "yolo":    yolo_ok,
-        "cookies": cookies_status,
-        "version": "4.0"
+        "status":       "ok",
+        "ffmpeg":       ff,
+        "yt_dlp":       yt,
+        "face_engine":  "OpenCV Haar Cascade (built-in)",
+        "opencv":       cv2.__version__,
+        "version":      "5.0",
+        "cookies_exist": os.path.exists(YOUTUBE_COOKIES),
     })
 
-# ── Upload cookies.txt ─────────────────────────────────────────────────────────
+# ── Upload cookies ────────────────────────────────────────────────────────────
 @app.route("/upload-cookies", methods=["POST"])
 def upload_cookies():
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-
-    platform = request.form.get("platform", "youtube").lower()
+    if not check_auth(): return jsonify({"error":"Unauthorized"}),401
     if "file" not in request.files:
-        return jsonify({"error": "No file. Use field name: file"}), 400
+        return jsonify({"error":"No file. Field name: file"}),400
+    request.files["file"].save(YOUTUBE_COOKIES)
+    return jsonify({"success":True,"message":"cookies.txt saved"})
 
-    file = request.files["file"]
-
-    paths = {
-        "youtube":   YOUTUBE_COOKIES,
-        "instagram": INSTAGRAM_COOKIES,
-        "tiktok":    TIKTOK_COOKIES,
-    }
-    save_path = paths.get(platform, YOUTUBE_COOKIES)
-    file.save(save_path)
-
-    return jsonify({
-        "success":  True,
-        "platform": platform,
-        "message":  f"cookies.txt saved for {platform}"
-    })
-
-# ── Download video (URL) ───────────────────────────────────────────────────────
+# ── Download video ────────────────────────────────────────────────────────────
 @app.route("/download", methods=["POST"])
 def download():
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
+    if not check_auth(): return jsonify({"error":"Unauthorized"}),401
     data = request.get_json() or {}
-    url  = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "URL required"}), 400
+    url  = data.get("url","").strip()
+    if not url: return jsonify({"error":"URL required"}),400
 
     job_id = str(uuid.uuid4())[:8]
-    JOBS[job_id] = {
-        "status": "queued", "percent": 0,
-        "downloaded_mb": 0, "total_mb": 0,
-        "speed_kb": 0, "eta_sec": 0,
-        "result": None, "filename": None,
-        "size_mb": 0, "error": None
-    }
+    JOBS[job_id] = {"status":"queued","percent":0,"downloaded_mb":0,
+                    "total_mb":0,"speed_kb":0,"eta_sec":0,
+                    "result":None,"filename":None,"size_mb":0,"error":None}
 
     def _run():
         import yt_dlp
-
-        platform     = detect_platform(url)
-        cookies_path = get_cookies_path(platform)
-        out_tmpl     = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
+        platform    = detect_platform(url)
+        out_tmpl    = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
+        cookies_ok  = os.path.exists(YOUTUBE_COOKIES)
 
         def _hook(d):
             if d.get("status") == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
-                dl    = d.get("downloaded_bytes", 0)
-                update_job(job_id,
-                    status="downloading",
-                    percent=round(dl / total * 100, 1),
-                    downloaded_mb=round(dl / 1048576, 1),
-                    total_mb=round(total / 1048576, 1),
-                    speed_kb=round((d.get("speed") or 0) / 1024, 1),
+                dl    = d.get("downloaded_bytes",0)
+                upd(job_id, status="downloading",
+                    percent=round(dl/total*100,1),
+                    downloaded_mb=round(dl/1048576,1),
+                    total_mb=round(total/1048576,1),
+                    speed_kb=round((d.get("speed") or 0)/1024,1),
                     eta_sec=d.get("eta") or 0)
             elif d.get("status") == "finished":
-                update_job(job_id, status="processing", percent=99)
+                upd(job_id, status="processing", percent=99)
 
-        # ── Base options for all platforms ────────────────────────────────
-        base_opts = {
+        # Base opts
+        base = {
             "outtmpl":             out_tmpl,
             "progress_hooks":      [_hook],
             "noplaylist":          True,
@@ -222,202 +112,140 @@ def download():
             "fragment_retries":    10,
             "merge_output_format": "mp4",
         }
+        if cookies_ok:
+            base["cookiefile"] = YOUTUBE_COOKIES
 
-        # Add cookies if available
-        if cookies_path:
-            base_opts["cookiefile"] = cookies_path
-
-        # ── Platform specific options ──────────────────────────────────────
+        # Platform configs
         if platform == "youtube":
-            base_opts.update({
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["android", "web"],
-                    }
-                },
-                "http_headers": {
-                    "User-Agent":      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            })
-            format_attempts = [
-                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
-                "18",
-                "best",
+            # ✅ android_vr is the best bot bypass in 2025
+            configs = [
+                {**base,
+                 "format": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
+                 "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+                 "http_headers": {"User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 13; en_US) gzip"}},
+                {**base,
+                 "format": "18",
+                 "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+                 "http_headers": {"User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 13; en_US) gzip"}},
+                {**base,
+                 "format": "best",
+                 "extractor_args": {"youtube": {"player_client": ["android","web"]}},
+                 "http_headers": {"User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"}},
             ]
-
         elif platform == "tiktok":
-            base_opts.update({
-                "http_headers": {
-                    "User-Agent":      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                    "Referer":         "https://www.tiktok.com/",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-                "extractor_args": {
-                    "tiktok": {
-                        "api_hostname": ["api22-normal-c-useast2a.tiktokv.com"],
-                    }
-                },
-            })
-            format_attempts = [
-                "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-                "best",
+            configs = [
+                {**base,
+                 "format": "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+                 "http_headers": {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36",
+                                  "Referer": "https://www.tiktok.com/"}},
             ]
-
         elif platform == "instagram":
-            base_opts.update({
-                "http_headers": {
-                    "User-Agent":      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            })
-            format_attempts = [
-                "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-                "best",
+            configs = [
+                {**base,
+                 "format": "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+                 "http_headers": {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"}},
             ]
-
         else:
-            base_opts.update({
-                "http_headers": {
-                    "User-Agent":      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            })
-            format_attempts = [
-                "bestvideo[height<=720][ext=mp4]+bestaudio/best[height<=720][ext=mp4]/best",
-                "best",
+            configs = [
+                {**base,
+                 "format": "bestvideo[height<=720][ext=mp4]+bestaudio/best[height<=720]/best",
+                 "http_headers": {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"}},
             ]
 
-        # ── Try each format ────────────────────────────────────────────────
-        last_error = None
-
-        for fmt in format_attempts:
+        last_err = None
+        for opts in configs:
             try:
-                opts = {**base_opts, "format": fmt}
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info  = ydl.extract_info(url, download=True)
                     fname = ydl.prepare_filename(info)
-                    mp4   = os.path.splitext(fname)[0] + ".mp4"
+                    mp4   = os.path.splitext(fname)[0]+".mp4"
                     path  = mp4 if os.path.exists(mp4) else fname
                     if os.path.exists(path):
-                        update_job(job_id,
-                            status="done", percent=100,
-                            result=path,
-                            filename=os.path.basename(path),
-                            size_mb=round(os.path.getsize(path) / 1048576, 1))
+                        upd(job_id, status="done", percent=100,
+                            result=path, filename=os.path.basename(path),
+                            size_mb=round(os.path.getsize(path)/1048576,1))
                         return
             except Exception as e:
-                last_error = str(e)
+                last_err = str(e)
                 continue
 
-        update_job(job_id, status="failed",
-                   error=last_error or "All download attempts failed")
+        upd(job_id, status="failed",
+            error=f"All attempts failed. Last error: {last_err}")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"job_id": job_id})
 
-# ── Upload video from device ───────────────────────────────────────────────────
+# ── Upload video from device ──────────────────────────────────────────────────
 @app.route("/upload", methods=["POST"])
 def upload_video():
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
+    if not check_auth(): return jsonify({"error":"Unauthorized"}),401
     if "video" not in request.files:
-        return jsonify({"error": "No video file in request"}), 400
+        return jsonify({"error":"No video file"}),400
+    f      = request.files["video"]
+    job_id = str(uuid.uuid4())[:8]
+    path   = os.path.join(UPLOAD_DIR, f"{job_id}_{f.filename}")
+    f.save(path)
+    size   = os.path.getsize(path)/1048576
+    JOBS[job_id] = {"status":"done","percent":100,"result":path,
+                    "filename":f.filename,"size_mb":round(size,1),"error":None}
+    return jsonify({"job_id":job_id,"filename":f.filename,
+                    "size_mb":round(size,1),"message":"Uploaded"})
 
-    file      = request.files["video"]
-    job_id    = str(uuid.uuid4())[:8]
-    save_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
-    file.save(save_path)
-    size_mb = os.path.getsize(save_path) / 1048576
-    JOBS[job_id] = {
-        "status":   "done",  "percent":  100,
-        "result":   save_path, "filename": file.filename,
-        "size_mb":  round(size_mb, 1), "error": None,
-    }
-    return jsonify({
-        "job_id":   job_id,
-        "filename": file.filename,
-        "size_mb":  round(size_mb, 1),
-        "message":  "Video uploaded successfully"
-    })
-
-# ── Upload reference face image ────────────────────────────────────────────────
+# ── Upload reference face image ───────────────────────────────────────────────
 @app.route("/upload-ref-face", methods=["POST"])
 def upload_ref_face():
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
+    if not check_auth(): return jsonify({"error":"Unauthorized"}),401
     if "image" not in request.files:
-        return jsonify({"error": "No image file. Use field name: image"}), 400
+        return jsonify({"error":"No image. Field name: image"}),400
+    f      = request.files["image"]
+    job_id = request.form.get("job_id","default")
+    ext    = os.path.splitext(f.filename)[1] or ".jpg"
+    path   = os.path.join(REF_DIR, f"{job_id}_ref{ext}")
+    f.save(path)
 
-    file   = request.files["image"]
-    job_id = request.form.get("job_id", "")
-    if not job_id:
-        return jsonify({"error": "job_id required"}), 400
+    img = cv2.imread(path)
+    if img is None:
+        return jsonify({"error":"Cannot read image file"}),400
 
-    ext      = os.path.splitext(file.filename)[1] or ".jpg"
-    ref_path = os.path.join(REF_DIR, f"{job_id}_ref{ext}")
-    file.save(ref_path)
+    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 4, minSize=(30,30))
+    if len(faces) == 0:
+        return jsonify({"error":"No face detected in reference image. Use a clear frontal photo."}),400
 
-    try:
-        import cv2, numpy as np
-        img = cv2.imread(ref_path)
-        if img is None:
-            os.remove(ref_path)
-            return jsonify({"error": "Could not read image file."}), 400
+    # Save face crop embedding
+    x, y, w, h = faces[0]
+    crop = cv2.resize(img[y:y+h, x:x+w], (64,64)).astype(np.float32)/255.0
+    np.save(os.path.join(REF_DIR, f"{job_id}_ref.npy"), crop.flatten())
 
-        img_rgb   = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        embedding = get_face_embedding(img_rgb)
+    return jsonify({"success":True,
+                    "message":f"Face detected! Ready for specific face search."})
 
-        if embedding is None:
-            os.remove(ref_path)
-            return jsonify({
-                "error": "No face detected in reference image. Use a clear frontal photo."
-            }), 400
-
-        emb_path = os.path.join(REF_DIR, f"{job_id}_ref.npy")
-        np.save(emb_path, embedding)
-
-        return jsonify({
-            "success": True,
-            "message": "Face detected and saved! Ready for specific face search."
-        })
-
-    except Exception as e:
-        return jsonify({"error": f"Processing error: {str(e)}"}), 500
-
-# ── Job status ─────────────────────────────────────────────────────────────────
+# ── Job status ────────────────────────────────────────────────────────────────
 @app.route("/job/<job_id>", methods=["GET"])
 def job_status(job_id):
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
+    if not check_auth(): return jsonify({"error":"Unauthorized"}),401
     job = JOBS.get(job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
+    if not job: return jsonify({"error":"Job not found"}),404
     return jsonify(job)
 
-# ── Split video ────────────────────────────────────────────────────────────────
+# ── Split video ───────────────────────────────────────────────────────────────
 @app.route("/split", methods=["POST"])
 def split():
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-
+    if not check_auth(): return jsonify({"error":"Unauthorized"}),401
     data      = request.get_json() or {}
-    job_id    = data.get("job_id", "")
-    clip_secs = int(data.get("clip_seconds", 4))
+    job_id    = data.get("job_id","")
+    clip_secs = int(data.get("clip_seconds",4))
 
     job = JOBS.get(job_id)
     if not job or job.get("status") != "done":
-        return jsonify({"error": "Video not ready. Download or upload first."}), 400
-
-    video_path = job.get("result")
-    if not video_path or not os.path.exists(video_path):
-        return jsonify({"error": "Video file not found on server."}), 400
+        return jsonify({"error":"Video not ready."}),400
+    video_path = job.get("result","")
+    if not os.path.exists(video_path):
+        return jsonify({"error":"Video file not found"}),400
 
     split_job_id = f"{job_id}_split"
-    JOBS[split_job_id] = {
-        "status": "processing", "percent": 0,
-        "clips": [], "count": 0, "error": None
-    }
+    JOBS[split_job_id] = {"status":"processing","percent":0,
+                          "clips":[],"count":0,"error":None}
 
     def _split():
         try:
@@ -425,225 +253,187 @@ def split():
             os.makedirs(out_dir, exist_ok=True)
             ff = shutil.which("ffmpeg") or "ffmpeg"
 
-            probe    = subprocess.run([ff, "-i", video_path],
-                                      capture_output=True, text=True)
+            probe = subprocess.run([ff,"-i",video_path],
+                capture_output=True, text=True)
             duration = 0
             for line in probe.stderr.split("\n"):
                 if "Duration:" in line:
                     try:
                         t = line.split("Duration:")[1].split(",")[0].strip()
-                        h, m, s = t.split(":")
-                        duration = int(h)*3600 + int(m)*60 + float(s)
-                    except Exception:
-                        pass
+                        h,m,s = t.split(":")
+                        duration = int(h)*3600+int(m)*60+float(s)
+                    except: pass
 
-            cmd = [
-                ff, "-i", video_path,
-                "-c", "copy", "-map", "0",
-                "-segment_time", str(clip_secs),
-                "-f", "segment", "-reset_timestamps", "1", "-y",
-                os.path.join(out_dir, "clip_%04d.mp4")
-            ]
-            process = subprocess.Popen(cmd, stderr=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, text=True)
-            for line in process.stderr:
+            cmd = [ff,"-i",video_path,"-c","copy","-map","0",
+                   "-segment_time",str(clip_secs),"-f","segment",
+                   "-reset_timestamps","1","-y",
+                   os.path.join(out_dir,"clip_%04d.mp4")]
+
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, text=True)
+            for line in proc.stderr:
                 if "time=" in line and duration > 0:
                     try:
-                        t_str = line.split("time=")[1].split(" ")[0].strip()
-                        h, m, s = t_str.split(":")
-                        cur = int(h)*3600 + int(m)*60 + float(s)
-                        pct = min(round(cur / duration * 100, 1), 99)
-                        update_job(split_job_id, percent=pct)
-                    except Exception:
-                        pass
-            process.wait()
-            if process.returncode != 0:
-                raise Exception(f"ffmpeg failed code {process.returncode}")
+                        t = line.split("time=")[1].split(" ")[0].strip()
+                        h,m,s = t.split(":")
+                        cur = int(h)*3600+int(m)*60+float(s)
+                        upd(split_job_id, percent=min(round(cur/duration*100,1),99))
+                    except: pass
+            proc.wait()
+            if proc.returncode != 0:
+                raise Exception(f"FFmpeg error code {proc.returncode}")
 
             clips = sorted([f for f in os.listdir(out_dir) if f.endswith(".mp4")])
-            update_job(split_job_id, status="done", percent=100,
-                       clips=clips, count=len(clips), job_dir=job_id)
+            upd(split_job_id, status="done", percent=100,
+                clips=clips, count=len(clips), job_dir=job_id)
         except Exception as e:
-            update_job(split_job_id, status="failed", error=str(e))
+            upd(split_job_id, status="failed", error=str(e))
 
     threading.Thread(target=_split, daemon=True).start()
     return jsonify({"split_job_id": split_job_id})
 
-# ── Face Filter — YOLO ─────────────────────────────────────────────────────────
+# ── Face Filter — OpenCV ──────────────────────────────────────────────────────
 @app.route("/face-filter", methods=["POST"])
 def face_filter():
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-
+    if not check_auth(): return jsonify({"error":"Unauthorized"}),401
     data        = request.get_json() or {}
-    job_id      = data.get("job_id", "")
-    filter_type = data.get("filter_type", "any")
-    threshold   = float(data.get("threshold", 0.75))
-    clip_secs   = int(data.get("clip_seconds", 4))
-    clip_dir    = os.path.join(CLIPS_DIR, job_id)
+    job_id      = data.get("job_id","")
+    filter_type = data.get("filter_type","any")
+    clip_secs   = int(data.get("clip_seconds",4))
 
-    clips_exist = (os.path.exists(clip_dir) and
-                   any(f.endswith(".mp4") for f in os.listdir(clip_dir)))
-    if not clips_exist:
+    clip_dir   = os.path.join(CLIPS_DIR, job_id)
+    clips_ok   = (os.path.exists(clip_dir) and
+                  any(f.endswith(".mp4") for f in os.listdir(clip_dir)))
+
+    # Auto-split if clips not found
+    if not clips_ok:
         job = JOBS.get(job_id)
         if not job or not job.get("result"):
-            return jsonify({"error": "Video not found. Upload a video first."}), 400
+            return jsonify({"error":"Video not found. Upload first."}),400
         video_path = job["result"]
         if not os.path.exists(video_path):
-            return jsonify({"error": "Video file missing on server."}), 400
+            return jsonify({"error":"Video file missing"}),400
         os.makedirs(clip_dir, exist_ok=True)
         ff = shutil.which("ffmpeg") or "ffmpeg"
-        subprocess.run([
-            ff, "-i", video_path,
-            "-c", "copy", "-map", "0",
-            "-segment_time", str(clip_secs),
-            "-f", "segment", "-reset_timestamps", "1", "-y",
-            os.path.join(clip_dir, "clip_%04d.mp4")
-        ], capture_output=True)
+        subprocess.run([ff,"-i",video_path,"-c","copy","-map","0",
+                        "-segment_time",str(clip_secs),"-f","segment",
+                        "-reset_timestamps","1","-y",
+                        os.path.join(clip_dir,"clip_%04d.mp4")],
+                       capture_output=True)
 
     filter_job_id = f"{job_id}_filter"
-    JOBS[filter_job_id] = {
-        "status": "processing", "percent": 0,
-        "matched": [], "total": 0, "count": 0,
-        "mode": filter_type, "error": None
-    }
+    JOBS[filter_job_id] = {"status":"processing","percent":0,
+                           "matched":[],"total":0,"count":0,"error":None}
 
     def _filter():
         try:
-            import cv2, numpy as np
-            model = yolo()
+            clips = sorted([f for f in os.listdir(clip_dir) if f.endswith(".mp4")])
+            total = len(clips)
+            upd(filter_job_id, total=total)
 
-            ref_embedding = None
+            # Load reference for specific face
+            ref_vec = None
             if filter_type == "specific":
-                emb_path = os.path.join(REF_DIR, f"{job_id}_ref.npy")
-                if os.path.exists(emb_path):
-                    ref_embedding = np.load(emb_path)
+                npy = os.path.join(REF_DIR, f"{job_id}_ref.npy")
+                if os.path.exists(npy):
+                    ref_vec = np.load(npy)
                 else:
-                    ref_files = [f for f in os.listdir(REF_DIR)
-                                 if f.startswith(f"{job_id}_ref") and
-                                 not f.endswith(".npy")]
-                    if ref_files:
-                        img = cv2.imread(os.path.join(REF_DIR, ref_files[0]))
-                        if img is not None:
-                            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                            ref_embedding = get_face_embedding(rgb)
-
-                if ref_embedding is None:
-                    update_job(filter_job_id, status="failed",
-                               error="Reference image not found. Upload a reference photo first.")
+                    upd(filter_job_id, status="failed",
+                        error="Reference face not found. Upload reference image first.")
                     return
 
-            clips   = sorted([f for f in os.listdir(clip_dir) if f.endswith(".mp4")])
-            total   = len(clips)
             matched = []
-            update_job(filter_job_id, total=total)
-
             for i, clip in enumerate(clips):
-                clip_path = os.path.join(clip_dir, clip)
-                cap       = cv2.VideoCapture(clip_path)
-                found     = False
-                frame_no  = 0
-
+                cap   = cv2.VideoCapture(os.path.join(clip_dir, clip))
+                found = False
+                fc    = 0
                 while cap.isOpened() and not found:
                     ret, frame = cap.read()
-                    if not ret:
-                        break
-                    if frame_no % 8 == 0:
-                        rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        results  = model(rgb, verbose=False, conf=0.4)
-                        boxes    = results[0].boxes
-                        has_face = boxes is not None and len(boxes) > 0
-
-                        if has_face:
-                            if filter_type == "specific" and ref_embedding is not None:
-                                frame_emb = get_face_embedding(rgb)
-                                if frame_emb is not None:
-                                    sim = cosine_similarity(ref_embedding, frame_emb)
-                                    if sim >= threshold:
-                                        found = True
-                            else:
+                    if not ret: break
+                    if fc % 15 == 0:
+                        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        faces = FACE_CASCADE.detectMultiScale(
+                            gray, scaleFactor=1.1, minNeighbors=4,
+                            minSize=(30,30))
+                        if len(faces) > 0:
+                            if filter_type == "any":
                                 found = True
-                    frame_no += 1
-
+                            elif ref_vec is not None:
+                                # Compare face crop
+                                for (x,y,w,h) in faces:
+                                    crop = cv2.resize(
+                                        frame[y:y+h, x:x+w],
+                                        (64,64)).astype(np.float32)/255.0
+                                    vec = crop.flatten()
+                                    # Cosine similarity
+                                    sim = float(np.dot(ref_vec, vec) /
+                                                (np.linalg.norm(ref_vec)*np.linalg.norm(vec)+1e-8))
+                                    if sim >= 0.70:
+                                        found = True
+                                        break
+                    fc += 1
                 cap.release()
-                if found:
-                    matched.append(clip)
+                if found: matched.append(clip)
+                upd(filter_job_id,
+                    percent=round((i+1)/total*100,1),
+                    matched=matched, count=len(matched))
 
-                pct = round((i + 1) / total * 100, 1)
-                update_job(filter_job_id, percent=pct,
-                           matched=matched, count=len(matched))
-
-            update_job(filter_job_id,
-                       status="done", percent=100,
-                       matched=matched, count=len(matched),
-                       total=total, source_job_id=job_id)
+            upd(filter_job_id, status="done", percent=100,
+                matched=matched, count=len(matched), total=total)
 
         except Exception as e:
-            update_job(filter_job_id, status="failed",
-                       error=str(e) + "\n" + traceback.format_exc())
+            upd(filter_job_id, status="failed",
+                error=str(e)+"\n"+traceback.format_exc())
 
     threading.Thread(target=_filter, daemon=True).start()
     return jsonify({"filter_job_id": filter_job_id})
 
-# ── Serve video file ───────────────────────────────────────────────────────────
+# ── Serve files ───────────────────────────────────────────────────────────────
 @app.route("/get-video/<job_id>", methods=["GET"])
 def get_video(job_id):
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
+    if not check_auth(): return jsonify({"error":"Unauthorized"}),401
     job = JOBS.get(job_id)
-    if not job or not job.get("result"):
-        return jsonify({"error": "Video not found"}), 404
+    if not job or not job.get("result"): return jsonify({"error":"Not found"}),404
     path = job["result"]
-    if not os.path.exists(path):
-        return jsonify({"error": "File not found on disk"}), 404
+    if not os.path.exists(path): return jsonify({"error":"File missing"}),404
     return send_file(path, as_attachment=True,
-                     download_name=job.get("filename", "video.mp4"),
-                     mimetype="video/mp4")
+                     download_name=job.get("filename","video.mp4"))
 
-# ── Serve all clips as ZIP ─────────────────────────────────────────────────────
 @app.route("/get-clips/<job_id>", methods=["GET"])
 def get_clips(job_id):
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
+    if not check_auth(): return jsonify({"error":"Unauthorized"}),401
     clip_dir = os.path.join(CLIPS_DIR, job_id)
-    if not os.path.exists(clip_dir):
-        return jsonify({"error": "No clips found"}), 404
+    if not os.path.exists(clip_dir): return jsonify({"error":"No clips"}),404
     clips = sorted([f for f in os.listdir(clip_dir) if f.endswith(".mp4")])
-    if not clips:
-        return jsonify({"error": "No clips in directory"}), 404
+    if not clips: return jsonify({"error":"Empty"}),404
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for clip in clips:
-            zf.write(os.path.join(clip_dir, clip), clip)
+    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as zf:
+        for c in clips:
+            zf.write(os.path.join(clip_dir,c), c)
     buf.seek(0)
     return send_file(buf, as_attachment=True,
                      download_name=f"all_clips_{job_id}.zip",
                      mimetype="application/zip")
 
-# ── Serve matched clips as ZIP ─────────────────────────────────────────────────
 @app.route("/get-matched/<job_id>", methods=["GET"])
 def get_matched(job_id):
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-    filter_job_id = f"{job_id}_filter"
-    job = JOBS.get(filter_job_id)
-    if not job or job.get("status") != "done":
-        return jsonify({"error": "Filter not done yet"}), 400
-    matched  = job.get("matched", [])
+    if not check_auth(): return jsonify({"error":"Unauthorized"}),401
+    fj = JOBS.get(f"{job_id}_filter")
+    if not fj or fj.get("status") != "done":
+        return jsonify({"error":"Filter not done"}),400
+    matched  = fj.get("matched",[])
     clip_dir = os.path.join(CLIPS_DIR, job_id)
-    if not matched:
-        return jsonify({"error": "No matched clips found"}), 404
+    if not matched: return jsonify({"error":"No matched clips"}),404
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for clip in matched:
-            path = os.path.join(clip_dir, clip)
-            if os.path.exists(path):
-                zf.write(path, clip)
+    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as zf:
+        for c in matched:
+            p = os.path.join(clip_dir,c)
+            if os.path.exists(p): zf.write(p,c)
     buf.seek(0)
     return send_file(buf, as_attachment=True,
                      download_name=f"matched_{job_id}.zip",
                      mimetype="application/zip")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT",5000))
     app.run(host="0.0.0.0", port=port, debug=False)
