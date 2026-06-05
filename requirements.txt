@@ -1,7 +1,5 @@
-opencv-python-headless
-ffmpeg-python
 flask==3.0.3
-yt-dlp>=2024.12.13
-ultralytics
+yt-dlp
+opencv-python-headless
 numpy
 gunicorn
