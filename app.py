@@ -1,7 +1,9 @@
+"""
 Abdul Tool — Flask API Server v5.0
 - YouTube fix: android_vr player
 - Face Detection: OpenCV Haar Cascade (no YOLO, no download needed!)
 """
+
 from flask import Flask, request, jsonify, send_file
 import os, threading, uuid, subprocess, shutil, zipfile, io, traceback
 import cv2
